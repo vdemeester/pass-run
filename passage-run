@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# passage-run: inject secrets from passage into environment variables, then exec a command.
+#
+# Usage:
+#   passage-run <env-file> -- <command> [args...]
+#   passage-run -e VAR=passage/path [-e ...] -- <command> [args...]
+#   passage-run <env-file> -e VAR=passage/path -- <command> [args...]
+#
+# The env file maps environment variable names to passage paths:
+#   SYNTHETIC_API_KEY=ai/synthetic.new/api_key
+#   GEMINI_API_KEY=redhat/google/osp/vdeemest-api-key
+#
+# Lines starting with # and blank lines are ignored.
+# Inline -e flags can supplement or override the file.
+#
+# Options:
+#   -e VAR=path    Add a single mapping (can be repeated)
+#   -f <file>      Env file to load (alternative to positional argument)
+#   -q             Quiet: don't print status messages to stderr
+#   -n             Dry run: show what would be exported without running the command
+#   -p             Parallel: fetch secrets concurrently (faster but less readable errors)
+#   -h, --help     Show this help message
+
+set -euo pipefail
+
+PROG="passage-run"
+QUIET=false
+DRY_RUN=false
+PARALLEL=false
+ENV_FILE=""
+declare -a MAPPINGS=()
+
+usage() {
+    sed -n '3,17s/^# \{0,1\}//p' "$0"
+}
+
+die() {
+    echo "${PROG}: error: $*" >&2
+    exit 1
+}
+
+info() {
+    if [[ "$QUIET" == false ]]; then
+        echo "${PROG}: $*" >&2
+    fi
+}
+
+# Parse arguments before --
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -q)
+            QUIET=true
+            shift
+            ;;
+        -n)
+            DRY_RUN=true
+            shift
+            ;;
+        -p)
+            PARALLEL=true
+            shift
+            ;;
+        -e)
+            [[ $# -ge 2 ]] || die "-e requires an argument (VAR=passage/path)"
+            MAPPINGS+=("$2")
+            shift 2
+            ;;
+        -f)
+            [[ $# -ge 2 ]] || die "-f requires a file argument"
+            ENV_FILE="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            # Positional argument: treat as env file
+            if [[ -z "$ENV_FILE" ]]; then
+                ENV_FILE="$1"
+            else
+                die "unexpected argument: $1 (use -- to separate command)"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Must have a command to run (unless dry run)
+if [[ $# -eq 0 && "$DRY_RUN" == false ]]; then
+    die "no command specified (use: passage-run <env-file> -- <command> [args...])"
+fi
+
+# Must have at least one source of mappings
+if [[ -z "$ENV_FILE" && ${#MAPPINGS[@]} -eq 0 ]]; then
+    die "no env file or -e mappings specified"
+fi
+
+# Parse env file if provided
+declare -A VARS=()
+
+if [[ -n "$ENV_FILE" ]]; then
+    [[ -f "$ENV_FILE" ]] || die "env file not found: $ENV_FILE"
+    [[ -r "$ENV_FILE" ]] || die "env file not readable: $ENV_FILE"
+
+    line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_num=$((line_num + 1))
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        # Strip inline comments
+        line="${line%%#*}"
+        # Trim whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        # Validate format
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.+)$ ]]; then
+            VARS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+        else
+            die "${ENV_FILE}:${line_num}: invalid format: ${line}"
+        fi
+    done < "$ENV_FILE"
+fi
+
+# Apply -e overrides (after file, so they win)
+for mapping in "${MAPPINGS[@]}"; do
+    if [[ "$mapping" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.+)$ ]]; then
+        VARS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    else
+        die "invalid -e mapping: ${mapping} (expected VAR=passage/path)"
+    fi
+done
+
+if [[ ${#VARS[@]} -eq 0 ]]; then
+    die "no variable mappings found"
+fi
+
+# Verify passage is available
+command -v passage >/dev/null 2>&1 || die "passage not found in PATH"
+
+# Fetch secrets
+info "resolving ${#VARS[@]} secret(s) from passage..."
+
+fetch_secret() {
+    local var="$1" path="$2"
+    local value
+    if ! value=$(passage show "$path" 2>/dev/null); then
+        die "failed to fetch secret for ${var} from passage path: ${path}"
+    fi
+    # Only take the first line (password), matching passage convention
+    value="${value%%$'\n'*}"
+    if [[ -z "$value" ]]; then
+        die "empty secret for ${var} from passage path: ${path}"
+    fi
+    echo "${var}=${value}"
+}
+
+declare -A SECRETS=()
+
+if [[ "$PARALLEL" == true ]]; then
+    # Fetch in parallel using background jobs
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    pids=()
+    for var in "${!VARS[@]}"; do
+        path="${VARS[$var]}"
+        (
+            if result=$(fetch_secret "$var" "$path"); then
+                echo "$result" > "${tmpdir}/${var}"
+            else
+                exit 1
+            fi
+        ) &
+        pids+=($!)
+    done
+
+    # Wait for all and check for failures
+    for pid in "${pids[@]}"; do
+        wait "$pid" || die "a secret fetch failed (parallel mode)"
+    done
+
+    for var in "${!VARS[@]}"; do
+        if [[ -f "${tmpdir}/${var}" ]]; then
+            IFS='=' read -r _ value < "${tmpdir}/${var}"
+            SECRETS["$var"]="$value"
+        fi
+    done
+else
+    # Fetch sequentially
+    for var in "${!VARS[@]}"; do
+        path="${VARS[$var]}"
+        info "  ${var} ← ${path}"
+        result=$(fetch_secret "$var" "$path")
+        IFS='=' read -r _ value <<< "$result"
+        SECRETS["$var"]="$value"
+    done
+fi
+
+# Dry run: show what would be exported
+if [[ "$DRY_RUN" == true ]]; then
+    echo "# passage-run: would export the following variables:"
+    for var in "${!SECRETS[@]}"; do
+        echo "export ${var}=<${#SECRETS[$var]} chars>"
+    done
+    if [[ $# -gt 0 ]]; then
+        echo "# then exec: $*"
+    fi
+    exit 0
+fi
+
+# Export secrets and exec command
+for var in "${!SECRETS[@]}"; do
+    export "${var}=${SECRETS[$var]}"
+done
+
+info "exec: $*"
+exec "$@"
